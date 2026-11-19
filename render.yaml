@@ -7,5 +7,5 @@ services:
     startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /api/health
     envVars:
-      - key: SOURCE_URL
-        value: https://last-z.us/rankings?playerServers=66
+      - key: SOURCE_TEMPLATE
+        value: https://last-z.us/rankings?playerServers={server}
