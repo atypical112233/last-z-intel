@@ -6,8 +6,8 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 BASE=Path(__file__).parent
 DB_PATH=os.environ.get('DATABASE_PATH',str(BASE/'lastz.db'))
-SOURCE_TEMPLATE=os.environ.get('SOURCE_TEMPLATE','https://last-z.us/rankings?playerServers={server}')
-app=FastAPI(title='Last Z Intel',version='6.0')
+SOURCE_TEMPLATE=os.environ.get('SOURCE_TEMPLATE','https://last-z.us/rankings?playerServers={server}-{server}')
+app=FastAPI(title='Last Z Intel',version='7.0')
 def db():
  c=sqlite3.connect(DB_PATH); c.row_factory=sqlite3.Row
  c.execute('CREATE TABLE IF NOT EXISTS players(id INTEGER PRIMARY KEY,uid TEXT UNIQUE,name TEXT,server TEXT,alliance TEXT,power INTEGER DEFAULT 0,rank INTEGER,avatar TEXT,source TEXT,updated_at TEXT)')
@@ -17,7 +17,7 @@ class FetchIn(BaseModel): server:int=66
 @app.get('/',response_class=HTMLResponse)
 def home(): return (BASE/'index.html').read_text(encoding='utf-8')
 @app.get('/api/health')
-def health(): return {'ok':True,'version':'6.0','source_template':SOURCE_TEMPLATE}
+def health(): return {'ok':True,'version':'7.0','source_template':SOURCE_TEMPLATE}
 @app.get('/api/players')
 def players(q:str='',server:str='66',alliance:str='',sort:str='power'):
  server=str(int(server)); order={'power':'power DESC','name':'name COLLATE NOCASE','rank':'rank ASC'}.get(sort,'power DESC'); c=db(); sql='SELECT * FROM players WHERE server=?'; args=[server]
@@ -51,52 +51,103 @@ def dedupe(rows):
  return out
 def parse_players(raw,server,url):
  rows=[]
- # JSON-like sources
- try:
-  data=json.loads(raw)
-  def walk(obj):
-   if isinstance(obj,dict):
-    keys={str(k).lower():v for k,v in obj.items()}; nm=next((keys[k] for k in ['name','playername','player_name','nickname'] if keys.get(k)),None); pw=next((keys[k] for k in ['power','totalpower','playerpower'] if keys.get(k)),None); sid=str(keys.get('server',keys.get('state',server)))
-    if nm and pw and sid==str(server): rows.append({'uid':str(keys.get('uid',keys.get('playerid',''))) or None,'name':str(nm),'server':str(server),'alliance':str(keys.get('alliance',keys.get('guild',''))) or None,'power':power_num(pw),'rank':keys.get('rank'),'avatar':keys.get('avatar'),'source':url})
-    for v in obj.values(): walk(v)
-   elif isinstance(obj,list):
-    for v in obj: walk(v)
-  walk(data)
+ # First, inspect JSON in the whole response and JSON-bearing script tags.
+ payloads=[]
+ try: payloads.append(json.loads(raw))
  except Exception: pass
- if rows:return dedupe(rows)
  try:
   from bs4 import BeautifulSoup
   soup=BeautifulSoup(raw,'html.parser')
-  # Table row extraction
-  for tr in soup.select('tr'):
-   cells=[x.get_text(' ',strip=True) for x in tr.find_all(['td','th'])]; txt=' | '.join(cells)
-   if len(cells)>1 and re.search(r'(?:server|state)\s*#?\s*'+re.escape(str(server))+r'\b',txt,re.I):
-    p=max([power_num(x) for x in cells]+[0]); im=tr.find('img')
-    if p: rows.append({'uid':None,'name':cells[0],'server':str(server),'alliance':None,'power':p,'rank':None,'avatar':im.get('src') if im else None,'source':url})
-  # Card extraction. Only retain cards explicitly showing selected state and a power value.
-  for node in soup.select('article,li,.player,.rank-item,.ranking-item,.card'):
-   txt=node.get_text(' ',strip=True)
-   if not re.search(r'(?:server|state)\s*#?\s*'+re.escape(str(server))+r'\b',txt,re.I):continue
-   pm=re.search(r'(\d[\d,.]*\s*[KMB])\b',txt,re.I)
-   if not pm:continue
-   heading=node.select_one('h1,h2,h3,h4,strong,b,a'); nm=heading.get_text(' ',strip=True) if heading else ''
-   if not nm: nm=re.split(r'(?:server|state)\s*#?\s*'+re.escape(str(server))+r'\b',txt,flags=re.I)[0].strip(' ·|#')
-   im=node.find('img')
-   if nm and len(nm)<90: rows.append({'uid':None,'name':nm,'server':str(server),'alliance':None,'power':power_num(pm.group(1)),'rank':None,'avatar':im.get('src') if im else None,'source':url})
- except Exception: pass
+  for script in soup.select('script[type="application/json"],script#__NEXT_DATA__,script[type="application/ld+json"]'):
+   if script.string or script.get_text(strip=True):
+    try: payloads.append(json.loads(script.string or script.get_text()))
+    except Exception: pass
+ except Exception: soup=None
+ def walk(obj):
+  if isinstance(obj,dict):
+   keys={str(k).lower().replace('_',''):v for k,v in obj.items()}
+   nm=next((keys[k] for k in ['name','playername','nickname','username','displayname'] if keys.get(k)),None)
+   pw=next((keys[k] for k in ['power','totalpower','playerpower','combatpower'] if keys.get(k)),None)
+   sid=keys.get('server',keys.get('serverid',keys.get('state',keys.get('stateid',server))))
+   if nm and pw and str(sid)==str(server):
+    rows.append({'uid':str(keys.get('uid',keys.get('playerid',keys.get('id','')))) or None,'name':str(nm).strip(),'server':str(server),'alliance':str(keys.get('alliance',keys.get('guild',keys.get('allianceName','')))) or None,'power':power_num(pw),'rank':keys.get('rank',keys.get('serverrank')),'avatar':keys.get('avatar',keys.get('image',keys.get('profileimage'))),'source':url})
+   for v in obj.values(): walk(v)
+  elif isinstance(obj,list):
+   for v in obj: walk(v)
+ for data in payloads: walk(data)
+ if rows: return dedupe(rows)
+ if soup is None:
+  try:
+   from bs4 import BeautifulSoup
+   soup=BeautifulSoup(raw,'html.parser')
+  except Exception: return []
+ # Ranking cards on last-z.us expose phrases like "Global #275 · Server 66 #1".
+ server_pat=re.compile(r'\bserver\s*'+re.escape(str(server))+r'\s*#\s*(\d+)',re.I)
+ power_pat=re.compile(r'\b(\d[\d,.]*\s*[KMB])\b',re.I)
+ global_pat=re.compile(r'\bglobal\s*#\s*(\d+)',re.I)
+ filter_pat=re.compile(r'\bfilter\s*#\s*(\d+)',re.I)
+ # Consider all DOM block types, then process shortest candidate text first.
+ candidates=[]
+ for node in soup.find_all(['div','article','li','section','a']):
+  txt=node.get_text(' ',strip=True)
+  if not txt or len(txt)>1200: continue
+  sm=server_pat.search(txt); pm=power_pat.search(txt)
+  if sm and pm: candidates.append((len(txt),node,txt,sm,pm))
+ candidates.sort(key=lambda x:x[0])
+ seen=set()
+ for _,node,txt,sm,pm in candidates:
+  # Walk up a few ancestors so the player name/avatar can be found if the
+  # smallest matching element only contains the rank/power subline.
+  card=node
+  for _ in range(4):
+   if card.parent is None or getattr(card.parent,'name',None) in ('body','html'): break
+   parent=card.parent; ptxt=parent.get_text(' ',strip=True)
+   if len(ptxt)>1800: break
+   if server_pat.search(ptxt) and power_pat.search(ptxt): card=parent
+   else: break
+  txt=card.get_text(' ',strip=True)
+  sm=server_pat.search(txt) or sm; pm=power_pat.search(txt) or pm
+  # Prefer semantic heading, link text, image alt/title, then clean text fragments.
+  name=''
+  for el in card.select('h1,h2,h3,h4,[class*=name],[class*=player-name],[class*=username]'):
+   cand=el.get_text(' ',strip=True)
+   if cand and len(cand)<=80 and not re.search(r'(server|global|filter|rank|\d+\s*[KMB])',cand,re.I): name=cand; break
+  if not name:
+   for el in card.select('img[alt],img[title],a[title]'):
+    cand=(el.get('alt') or el.get('title') or '').strip()
+    if cand and len(cand)<=80 and not re.search(r'(server|global|filter|rank)',cand,re.I): name=cand; break
+  if not name:
+   # Strip rank metadata and power from visible text; first plausible token is usually the name.
+   cleaned=re.sub(r'\bFilter\s*#?\s*\d+\b|\bGlobal\s*#?\s*\d+\b|\bServer\s*'+re.escape(str(server))+r'\s*#?\s*\d+\b',' ',txt,flags=re.I)
+   cleaned=re.sub(r'\b\d[\d,.]*\s*[KMB]\b',' ',cleaned,flags=re.I)
+   parts=[x.strip(' ·|#:-') for x in re.split(r'[·|\n]+',cleaned) if x.strip()]
+   for cand in parts:
+    if 1<=len(cand)<=80 and not re.search(r'^(rank|power|server|global|filter|irt)$',cand,re.I): name=cand; break
+  if not name or name.lower() in seen: continue
+  seen.add(name.lower())
+  img=card.find('img'); avatar=(img.get('src') or img.get('data-src') or img.get('data-lazy-src')) if img else None
+  alliance=None
+  # Alliance text commonly appears after the server-rank phrase; keep conservative.
+  tail=txt[sm.end():]
+  for token in re.findall(r'\b[A-Z0-9]{2,8}\b',tail):
+   if token not in {'SERVER','GLOBAL','FILTER'}: alliance=token; break
+  rank=int(sm.group(1))
+  gr=global_pat.search(txt); fr=filter_pat.search(txt)
+  rows.append({'uid':None,'name':name,'server':str(server),'alliance':alliance,'power':power_num(pm.group(1)),'rank':rank,'avatar':avatar,'source':url,'global_rank':int(gr.group(1)) if gr else None,'filter_rank':int(fr.group(1)) if fr else None})
  return dedupe(rows)
+
 @app.post('/api/fetch')
 def fetch(payload:FetchIn):
  server=str(payload.server)
  if not 1<=int(server)<=1000: raise HTTPException(400,'State/server must be 1–1000')
  url=SOURCE_TEMPLATE.format(server=server)
  try:
-  req=urllib.request.Request(url,headers={'User-Agent':'Mozilla/5.0 (compatible; LastZIntel/6.0)','Accept':'text/html,application/json;q=0.9,*/*;q=0.8'})
+  req=urllib.request.Request(url,headers={'User-Agent':'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36','Accept':'text/html,application/json;q=0.9,*/*;q=0.8'})
   with urllib.request.urlopen(req,timeout=30) as response:
    raw=response.read().decode('utf-8','replace'); rows=parse_players(raw,server,url)
    if not rows:
     title=re.search(r'<title[^>]*>(.*?)</title>',raw,re.I|re.S); msg=f'HTTP {response.status} page reached, but no player rows could be verified for State {server}. Parser/source mismatch or unavailable cached records. No import performed.'
-    log(url,'empty',msg,0); return {'success':False,'url':url,'count':0,'message':msg,'preview':[],'state':server,'diagnostics':{'html_chars':len(raw),'page_title':title.group(1).strip() if title else 'unknown'}}
+    log(url,'empty',msg,0); return {'success':False,'url':url,'count':0,'message':msg,'preview':[],'state':server,'diagnostics':{'html_chars':len(raw),'page_title':title.group(1).strip() if title else 'unknown','server_filter_format':'range (server-server)','parser':'ranking-card heuristic v7'}}
    c=db(); now=datetime.now(timezone.utc).isoformat(); n=0
    for r in rows:
     uid=r.get('uid') or ('source:'+server+':'+r['name'].lower().strip())

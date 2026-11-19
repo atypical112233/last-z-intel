@@ -8,4 +8,4 @@ services:
     healthCheckPath: /api/health
     envVars:
       - key: SOURCE_TEMPLATE
-        value: https://last-z.us/rankings?playerServers={server}
+        value: https://last-z.us/rankings?playerServers={server}-{server}
