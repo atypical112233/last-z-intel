@@ -7,7 +7,7 @@ from pydantic import BaseModel
 BASE=Path(__file__).parent
 DB_PATH=os.environ.get('DATABASE_PATH',str(BASE/'lastz.db'))
 SOURCE_TEMPLATE=os.environ.get('SOURCE_TEMPLATE','https://last-z.us/rankings?playerServers={server}-{server}')
-app=FastAPI(title='Last Z Intel',version='7.0')
+app=FastAPI(title='Last Z Intel',version='8.0')
 def db():
  c=sqlite3.connect(DB_PATH); c.row_factory=sqlite3.Row
  c.execute('CREATE TABLE IF NOT EXISTS players(id INTEGER PRIMARY KEY,uid TEXT UNIQUE,name TEXT,server TEXT,alliance TEXT,power INTEGER DEFAULT 0,rank INTEGER,avatar TEXT,source TEXT,updated_at TEXT)')
@@ -17,7 +17,7 @@ class FetchIn(BaseModel): server:int=66
 @app.get('/',response_class=HTMLResponse)
 def home(): return (BASE/'index.html').read_text(encoding='utf-8')
 @app.get('/api/health')
-def health(): return {'ok':True,'version':'7.0','source_template':SOURCE_TEMPLATE}
+def health(): return {'ok':True,'version':'8.0','source_template':SOURCE_TEMPLATE}
 @app.get('/api/players')
 def players(q:str='',server:str='66',alliance:str='',sort:str='power'):
  server=str(int(server)); order={'power':'power DESC','name':'name COLLATE NOCASE','rank':'rank ASC'}.get(sort,'power DESC'); c=db(); sql='SELECT * FROM players WHERE server=?'; args=[server]
@@ -147,7 +147,7 @@ def fetch(payload:FetchIn):
    raw=response.read().decode('utf-8','replace'); rows=parse_players(raw,server,url)
    if not rows:
     title=re.search(r'<title[^>]*>(.*?)</title>',raw,re.I|re.S); msg=f'HTTP {response.status} page reached, but no player rows could be verified for State {server}. Parser/source mismatch or unavailable cached records. No import performed.'
-    log(url,'empty',msg,0); return {'success':False,'url':url,'count':0,'message':msg,'preview':[],'state':server,'diagnostics':{'html_chars':len(raw),'page_title':title.group(1).strip() if title else 'unknown','server_filter_format':'range (server-server)','parser':'ranking-card heuristic v7'}}
+    log(url,'empty',msg,0); return {'success':False,'url':url,'count':0,'message':msg,'preview':[],'state':server,'diagnostics':{'html_chars':len(raw),'content_type':response.headers.get('Content-Type','unknown'),'page_title':title.group(1).strip() if title else 'unknown','server_filter_format':'range (server-server)','parser':'ranking-card heuristic v8','server_phrase_hits':len(re.findall(r'server\s*'+re.escape(str(server)),raw,re.I)),'rank_phrase_hits':len(re.findall(r'global\s*#|server\s*#',raw,re.I)),'html_excerpt':raw[:900]}}
    c=db(); now=datetime.now(timezone.utc).isoformat(); n=0
    for r in rows:
     uid=r.get('uid') or ('source:'+server+':'+r['name'].lower().strip())
